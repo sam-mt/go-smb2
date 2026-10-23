@@ -56,21 +56,19 @@ func TestDFSRouter_OpPath_ShareRootNeverDot(t *testing.T) {
 	}
 }
 
-func TestDFSRouter_IsSelf(t *testing.T) {
-	d := &dfsRouter{ownServer: "WINSRV", ownShare: "public"}
-	cases := []struct {
-		server, share string
-		want          bool
-	}{
-		{"WINSRV", "public", true},        // exact
-		{"winsrv", "PUBLIC", true},        // case-insensitive (SMB is case-insensitive)
-		{"WINSRV", "backingshare", false}, // a DFS link target on the same server
-		{"FILESRV", "public", false},      // different server, same share name
-		{"", "", false},
-	}
-	for _, c := range cases {
-		if got := d.isSelf(c.server, c.share); got != c.want {
-			t.Errorf("isSelf(%q,%q)=%v, want %v", c.server, c.share, got, c.want)
+// TestDFSPathName guards the name sent with SMB2_FLAGS_DFS_OPERATIONS on a
+// DFS share: the server strips the first two components, so the name must
+// start with server\share. A share-relative name there opens the wrong
+// object (e.g. a file at the root opened the root directory).
+func TestDFSPathName(t *testing.T) {
+	for _, c := range []struct{ tree, name, want string }{
+		{`\\srv\dfsroot`, `file.txt`, `srv\dfsroot\file.txt`},
+		{`\\srv\dfsroot`, `link\sub\f`, `srv\dfsroot\link\sub\f`},
+		{`\\srv\dfsroot`, ``, `srv\dfsroot`},
+		{`\\10.0.0.1\dfsroot`, `a`, `10.0.0.1\dfsroot\a`},
+	} {
+		if got := dfsPathName(c.tree, c.name); got != c.want {
+			t.Errorf("dfsPathName(%q, %q)=%q, want %q", c.tree, c.name, got, c.want)
 		}
 	}
 }

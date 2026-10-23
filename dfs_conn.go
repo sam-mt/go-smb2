@@ -16,104 +16,169 @@ import (
 const dfsPort = "445"
 
 // backingConns owns the SMB sessions to DFS backing servers named in
-// referrals. One session per server is dialed on demand (with the origin
-// session's Dialer, so auth/negotiator settings match) and reused across
-// operations until close.
+// referrals, one per server, and the shares mounted on them. The
+// resolvers of a DFSCache share one, so all sessions using the cache have
+// a single session to each backing server, as a Windows client does,
+// rather than one each. Resolvers lease the sessions they use, and a
+// session is logged off when its last lease is released.
 type backingConns struct {
-	origin *Session // session whose Dialer is reused; never owned/closed here
-
 	mu    sync.Mutex
-	conns map[string]*Session // key: strings.ToLower(server)
+	conns map[string]*backingConn // key: strings.ToLower(server)
+}
+
+func newBackingConns() *backingConns {
+	return &backingConns{conns: make(map[string]*backingConn)}
+}
+
+// backingConn is the session to one backing server.
+type backingConn struct {
+	key    string
+	dialed chan struct{} // closed when the dial has finished
+	s      *Session      // the session, once dialed without error
+	err    error         // the dial error
+	refs   int           // leases, guarded by backingConns.mu
 
 	sharesMu sync.Mutex
-	shares   map[string]*Share // key: strings.ToLower(server + "\\" + share)
+	shares   map[string]*Share // key: strings.ToLower(share)
 }
 
-func newBackingConns(origin *Session) *backingConns {
-	return &backingConns{
-		origin: origin,
-		conns:  make(map[string]*Session),
-		shares: make(map[string]*Share),
+// dfsLeases records the backing sessions one resolver uses. It is
+// guarded by backingConns.mu.
+type dfsLeases map[*backingConn]bool
+
+// unusable reports whether bc's dial failed or its connection has died.
+// It is false while the dial is in progress.
+func (bc *backingConn) unusable() bool {
+	select {
+	case <-bc.dialed:
+		return bc.err != nil || bc.s.Closed()
+	default:
+		return false
 	}
 }
 
-// shareFor returns a tree connect to \\server\share on the backing
-// session, mounting and caching it on first use. The returned share has
-// no DFS router of its own: it is reached only via createFile retries
-// whose paths are already fully resolved, so it needs no further routing.
-func (b *backingConns) shareFor(ctx context.Context, server, share string, mapping utf16le.MapChars) (*Share, error) {
-	key := strings.ToLower(server + `\` + share)
-
-	b.sharesMu.Lock()
-	if fs, ok := b.shares[key]; ok {
-		b.sharesMu.Unlock()
-		return fs, nil
-	}
-	b.sharesMu.Unlock()
-
-	sess, err := b.sessionFor(ctx, server)
-	if err != nil {
-		return nil, err
-	}
-	fs, err := sess.mountRaw(fmt.Sprintf(`\\%s\%s`, server, share), mapping)
-	if err != nil {
-		return nil, fmt.Errorf("dfs: mount backing \\\\%s\\%s: %w", server, share, err)
-	}
-
-	b.sharesMu.Lock()
-	if existing, ok := b.shares[key]; ok {
-		// Lost a race; reuse the winner and drop our duplicate.
-		b.sharesMu.Unlock()
-		_ = fs.Umount()
-		return existing, nil
-	}
-	b.shares[key] = fs
-	b.sharesMu.Unlock()
-	return fs, nil
-}
-
-// sessionFor returns a session connected to server on port 445. If server
-// is the origin server the origin session is returned (no second dial).
-// Otherwise a cached session is reused, or a new one is dialed with the
-// origin's Dialer and cached.
-func (b *backingConns) sessionFor(ctx context.Context, server string) (*Session, error) {
-	if strings.EqualFold(server, b.origin.serverName()) {
-		return b.origin, nil
-	}
-
+// session returns the session to server, dialing it with d's settings if
+// there is none or it has died, and leases it in leases. Concurrent
+// callers wait for a single dial.
+func (b *backingConns) session(ctx context.Context, server string, d Dialer, leases dfsLeases) (*backingConn, error) {
 	key := strings.ToLower(server)
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if s, ok := b.conns[key]; ok {
-		return s, nil
+	bc := b.conns[key]
+	if bc != nil && bc.unusable() {
+		delete(b.conns, key) // dial again
+		bc = nil
 	}
-
-	d := b.origin.dialer
-	s, err := d.Dial(ctx, net.JoinHostPort(server, dfsPort))
-	if err != nil {
-		return nil, fmt.Errorf("dfs: dial backing server %s: %w", server, err)
+	dial := bc == nil
+	if dial {
+		bc = &backingConn{key: key, dialed: make(chan struct{}), shares: make(map[string]*Share)}
+		b.conns[key] = bc
 	}
-	b.conns[key] = s
-	return s, nil
-}
-
-// close umounts cached backing shares and logs off every backing
-// session. The origin session is not touched — it is owned by the caller
-// that created the resolver. close is idempotent.
-func (b *backingConns) close() {
-	b.sharesMu.Lock()
-	for key, fs := range b.shares {
-		_ = fs.Umount()
-		delete(b.shares, key)
-	}
-	b.sharesMu.Unlock()
-
-	b.mu.Lock()
-	for key, s := range b.conns {
-		_ = s.Logoff()
-		delete(b.conns, key)
+	if !leases[bc] {
+		leases[bc] = true
+		bc.refs++
 	}
 	b.mu.Unlock()
+
+	if dial {
+		d.Initiator = initiatorFor(d.Initiator, server)
+		bc.s, bc.err = d.Dial(ctx, net.JoinHostPort(server, dfsPort))
+		if bc.err != nil {
+			bc.err = fmt.Errorf("dfs: dial backing server %s: %w", server, bc.err)
+		}
+		close(bc.dialed)
+	} else {
+		select {
+		case <-bc.dialed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if bc.err != nil {
+		return nil, bc.err
+	}
+	return bc, nil
+}
+
+// share returns a tree connect to \\server\share on bc, mounting it on
+// first use or if its connection has died. The returned share has no
+// DFS router of its own: it is reached only via createFile retries
+// whose paths are already fully resolved, so it needs no further routing.
+func (bc *backingConn) share(server, share string, mapping utf16le.MapChars) (*Share, error) {
+	key := strings.ToLower(share)
+
+	bc.sharesMu.Lock()
+	defer bc.sharesMu.Unlock()
+
+	if fs, ok := bc.shares[key]; ok && !fs.Closed() {
+		return fs, nil
+	}
+	fs, err := bc.s.mountRaw(fmt.Sprintf(`\\%s\%s`, server, share), mapping)
+	if err != nil {
+		return nil, fmt.Errorf("dfs: mount backing \\\\%s\\%s: %w", server, share, err)
+	}
+	bc.shares[key] = fs
+	return fs, nil
+}
+
+// release gives up leases. Sessions nobody leases any more are logged
+// off, after unmounting their shares.
+func (b *backingConns) release(leases dfsLeases) {
+	var unused []*backingConn
+	b.mu.Lock()
+	for bc := range leases {
+		bc.refs--
+		if bc.refs == 0 {
+			if b.conns[bc.key] == bc {
+				delete(b.conns, bc.key)
+			}
+			unused = append(unused, bc)
+		}
+	}
+	clear(leases)
+	b.mu.Unlock()
+
+	for _, bc := range unused {
+		bc.close()
+	}
+}
+
+// close unmounts bc's shares and logs off its session.
+func (bc *backingConn) close() {
+	<-bc.dialed
+	if bc.s == nil {
+		return
+	}
+	bc.sharesMu.Lock()
+	for key, fs := range bc.shares {
+		_ = fs.Umount()
+		delete(bc.shares, key)
+	}
+	bc.sharesMu.Unlock()
+	_ = bc.s.Logoff()
+}
+
+// initiatorFor returns an initiator that authenticates to the backing
+// server with the credentials of i. Each session needs an initiator of
+// its own, as it holds the state of the session's authentication, and
+// the server's SPN is its own: a Kerberos ticket for the server the
+// credentials were set up for is not valid for another one.
+func initiatorFor(i Initiator, server string) Initiator {
+	switch i := i.(type) {
+	case *NTLMInitiator:
+		c := &NTLMInitiator{
+			User:        i.User,
+			Password:    i.Password,
+			Hash:        i.Hash,
+			Domain:      i.Domain,
+			Workstation: i.Workstation,
+		}
+		if i.TargetSPN != "" {
+			c.TargetSPN = "cifs/" + server
+		}
+		return c
+	case *Krb5Initiator:
+		return &Krb5Initiator{Client: i.Client, TargetSPN: "cifs/" + server}
+	}
+	return i
 }

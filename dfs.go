@@ -64,12 +64,7 @@ func (fs *Share) ioctlFileless(req *smb2.IoctlRequest, extraHeaderFlags uint32) 
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, fs.effectiveMaxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = fs.loanCredit(payloadSize)
-	defer func() {
-		if err != nil {
-			fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = fs.borrowCredits(payloadSize)
 	if err != nil {
 		return nil, err
 	}

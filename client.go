@@ -1,12 +1,12 @@
 package smb2
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -17,7 +17,6 @@ import (
 
 	"github.com/cloudsoda/sddl"
 	"github.com/maestrohub-labs/go-smb2/internal/erref"
-	"github.com/maestrohub-labs/go-smb2/internal/msrpc"
 	"github.com/maestrohub-labs/go-smb2/internal/smb2"
 	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
 )
@@ -72,6 +71,17 @@ type Dialer struct {
 	// Optional; nil disables DFS diagnostics. The library performs no other
 	// logging, so this is the only sink.
 	DFSLog func(format string, args ...any)
+
+	// DFSCache, if non-nil, is the DFS referral cache used by sessions
+	// dialed with this Dialer, see DFSCache. If nil each mounted share has
+	// its own.
+	DFSCache *DFSCache
+
+	// DialContext, if non-nil, is used by Dial to open the TCP connection,
+	// including connections to DFS referral targets. It lets callers
+	// control name resolution, proxies and timeouts. If nil, a
+	// net.Dialer honouring ctx is used.
+	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 /*
@@ -80,7 +90,11 @@ The returned session doesn't inherit the context. If you want to use the same
 context call Session.WithContext.
 */
 func (d *Dialer) Dial(ctx context.Context, address string) (*Session, error) {
-	conn, err := net.Dial("tcp", address)
+	dial := d.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	conn, err := dial(ctx, "tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("establishing TCP connection: %w", err)
 	}
@@ -190,6 +204,13 @@ func (c *Session) Logoff() error {
 	return c.s.logoff(c.ctx)
 }
 
+// Closed reports whether the session's connection has been closed, by
+// Logoff, the server or a network failure, so the session can't be used
+// any more. It sends nothing to the server.
+func (c *Session) Closed() bool {
+	return c.s.conn.closed()
+}
+
 // Echo sends an echo request to the server.
 func (c *Session) Echo() error {
 	return c.s.echo(c.ctx)
@@ -234,128 +255,13 @@ func (c *Session) Mount(sharename string, opts ...MountOption) (*Share, error) {
 
 	fs := &Share{treeConn: tc, ctx: context.Background(), mapping: options.mapping}
 	if dfsOn {
-		// A plain mount can still cross a DFS link mid-operation (Case B),
-		// and a DFS-root share may need proactive resolution; attach routing
-		// so createFile can resolve on demand. The share's own identity is the
-		// (server, share) we just tree-connected to.
+		// A plain mount can still cross a DFS link mid-operation (Case B);
+		// attach routing so createFile can resolve on demand.
 		r := newDFSResolver(c)
 		c.warnIfNoDFSCap(r)
-		ownServer, ownShare, _ := splitUNC(sharename)
-		attachDFS(fs, r, sharename, "", ownServer, ownShare, true)
+		attachDFS(fs, r, sharename, "", true)
 	}
 	return fs, nil
-}
-
-func (c *Session) ListSharenames() ([]string, error) {
-	servername := c.addr
-	if c.host != "" {
-		servername = c.host
-	}
-
-	fs, err := c.Mount(fmt.Sprintf(`\\%s\IPC$`, servername))
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = fs.Umount()
-	}()
-
-	fs = fs.WithContext(c.ctx)
-
-	f, err := fs.OpenFile("srvsvc", os.O_RDWR, 0666)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	callId := rand.Uint32()
-
-	bindReq := &smb2.IoctlRequest{
-		CtlCode:           smb2.FSCTL_PIPE_TRANSCEIVE,
-		OutputOffset:      0,
-		OutputCount:       0,
-		MaxInputResponse:  0,
-		MaxOutputResponse: 4280,
-		Flags:             smb2.SMB2_0_IOCTL_IS_FSCTL,
-		Input: &msrpc.Bind{
-			CallId: callId,
-		},
-	}
-
-	output, err := f.ioctl(bindReq)
-	if err != nil {
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-	}
-
-	r1 := msrpc.BindAckDecoder(output)
-	if r1.IsInvalid() || r1.CallId() != callId {
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken bind ack response format"}}
-	}
-
-	callId++
-
-	reqReq := &smb2.IoctlRequest{
-		CtlCode:          smb2.FSCTL_PIPE_TRANSCEIVE,
-		OutputOffset:     0,
-		OutputCount:      0,
-		MaxInputResponse: 0,
-		// MaxOutputResponse: 4280,
-		MaxOutputResponse: 1024,
-		Flags:             smb2.SMB2_0_IOCTL_IS_FSCTL,
-		Input: &msrpc.NetShareEnumAllRequest{
-			CallId:     callId,
-			ServerName: servername,
-			Level:      1, // level 1 seems to be portable
-		},
-	}
-
-	output, err = f.ioctl(reqReq)
-	if err != nil {
-		if rerr, ok := err.(*ResponseError); ok && erref.NtStatus(rerr.Code) == erref.STATUS_BUFFER_OVERFLOW {
-			buf := make([]byte, 4280)
-
-			rlen := 4280 - len(output)
-
-			n, err := f.readAt(buf[:rlen], 0)
-			if err != nil {
-				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-			}
-
-			output = append(output, buf[:n]...)
-
-			r2 := msrpc.NetShareEnumAllResponseDecoder(output)
-			if r2.IsInvalid() || r2.CallId() != callId {
-				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-			}
-
-			for r2.IsIncomplete() {
-				n, err := f.readAt(buf, 0)
-				if err != nil {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-				}
-
-				r3 := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
-				if r3.IsInvalid() || r3.CallId() != callId {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-				}
-
-				output = append(output, r3.Buffer()...)
-
-				r2 = msrpc.NetShareEnumAllResponseDecoder(output)
-			}
-
-			return r2.ShareNameList(), nil
-		}
-
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-	}
-
-	r2 := msrpc.NetShareEnumAllResponseDecoder(output)
-	if r2.IsInvalid() || r2.IsIncomplete() || r2.CallId() != callId {
-		return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-	}
-
-	return r2.ShareNameList(), nil
 }
 
 // Share represents a SMB tree connection with VFS interface.
@@ -386,16 +292,26 @@ func (fs *Share) WithContext(ctx context.Context) *Share {
 	}
 }
 
+// Closed reports whether the connection the share is on has been closed,
+// by the server or a network failure, so the share can't be used any
+// more. It sends nothing to the server.
+func (fs *Share) Closed() bool {
+	return fs.treeConn.session.conn.closed()
+}
+
 // Umount disconects the current SMB tree.
 func (fs *Share) Umount() error {
 	if fs.ownsResolver && fs.dfs != nil {
 		fs.dfs.resolver.close() // tear down DFS backing-server sessions
+		if fs.dfs.borrowedTree {
+			return nil // the resolver disconnected it
+		}
 	}
 	return fs.treeConn.disconnect(fs.ctx)
 }
 
 func (fs *Share) Create(name string) (*File, error) {
-	return fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	return fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 }
 
 func (fs *Share) newFile(r smb2.CreateResponseDecoder, name string) *File {
@@ -464,7 +380,7 @@ func (fs *Share) OpenFile(name string, flag int, perm os.FileMode) (*File, error
 	}
 
 	var attrs uint32 = smb2.FILE_ATTRIBUTE_NORMAL
-	if perm&0200 == 0 {
+	if perm&0o200 == 0 {
 		attrs = smb2.FILE_ATTRIBUTE_READONLY
 	}
 
@@ -586,7 +502,7 @@ func (fs *Share) Readlink(name string) (string, error) {
 func (fs *Share) Remove(name string) error {
 	err := fs.remove(name)
 	if os.IsPermission(err) {
-		if e := fs.Chmod(name, 0666); e != nil {
+		if e := fs.Chmod(name, 0o666); e != nil {
 			return err
 		}
 		return fs.remove(name)
@@ -661,13 +577,22 @@ func (fs *Share) Rename(oldpath, newpath string) error {
 		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
 	}
 
+	target := newpath
+	if fs.dfs != nil {
+		target, err = fs.dfsRenameTarget(f, oldpath, newpath)
+		if err != nil {
+			_ = f.close()
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
+		}
+	}
+
 	info := &smb2.SetInfoRequest{
 		FileInfoClass:         smb2.FileRenameInformation,
 		AdditionalInformation: 0,
 		Input: &smb2.FileRenameInformationType2Encoder{
 			ReplaceIfExists: 1, // if a file exists at newpath, overwrite it
 			RootDirectory:   0,
-			FileName:        newpath,
+			FileName:        target,
 			Mapping:         fs.mapping,
 		},
 	}
@@ -793,13 +718,12 @@ func (fs *Share) Lstat(name string) (os.FileInfo, error) {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: err}
 	}
 
-	fi, err := f.fileStat, nil
-	if e := f.close(); err == nil {
-		err = e
-	}
-	if err != nil {
+	fi := f.fileStat
+
+	if err := f.close(); err != nil {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: err}
 	}
+
 	return fi, nil
 }
 
@@ -828,13 +752,12 @@ func (fs *Share) Stat(name string) (os.FileInfo, error) {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: err}
 	}
 
-	fi, err := f.fileStat, nil
-	if e := f.close(); err == nil {
-		err = e
-	}
-	if err != nil {
+	fi := f.fileStat
+
+	if err := f.close(); err != nil {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: err}
 	}
+
 	return fi, nil
 }
 
@@ -1211,12 +1134,7 @@ func (fs *Share) createFileRaw(name string, req *smb2.CreateRequest, followSymli
 		return fs.createFileRec(name, req)
 	}
 
-	req.CreditCharge, _, err = fs.loanCredit(0)
-	defer func() {
-		if err != nil {
-			fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = fs.borrowCredits(0)
 	if err != nil {
 		return nil, err
 	}
@@ -1240,12 +1158,7 @@ func (fs *Share) createFileRaw(name string, req *smb2.CreateRequest, followSymli
 
 func (fs *Share) createFileRec(name string, req *smb2.CreateRequest) (f *File, err error) {
 	for range clientMaxSymlinkDepth {
-		req.CreditCharge, _, err = fs.loanCredit(0)
-		defer func() {
-			if err != nil {
-				fs.chargeCredit(req.CreditCharge)
-			}
-		}()
+		req.CreditCharge, _, err = fs.borrowCredits(0)
 		if err != nil {
 			return nil, err
 		}
@@ -1307,21 +1220,11 @@ func evalSymlinkError(name string, errData []byte, mc utf16le.MapChars) (string,
 }
 
 func (fs *Share) sendRecv(cmd uint16, req smb2.Packet) (res []byte, err error) {
-	rr, err := fs.send(fs.ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	pkt, err := fs.recv(rr)
-	if err != nil {
-		return nil, err
-	}
-
-	return accept(cmd, pkt)
+	return fs.treeConn.sendRecv(fs.ctx, cmd, req)
 }
 
-func (fs *Share) loanCredit(payloadSize int) (creditCharge uint16, grantedPayloadSize int, err error) {
-	return fs.session.conn.loanCredit(fs.ctx, payloadSize)
+func (fs *Share) borrowCredits(payloadSize int) (creditCharge uint16, grantedPayloadSize int, err error) {
+	return fs.session.conn.borrowCredits(fs.ctx, payloadSize)
 }
 
 type File struct {
@@ -1359,7 +1262,11 @@ func (f *File) close() error {
 		Flags: 0,
 	}
 
-	req.CreditCharge = 1
+	var err error
+	req.CreditCharge, _, err = f.fs.borrowCredits(0)
+	if err != nil {
+		return err
+	}
 
 	req.FileId = f.fd
 
@@ -1441,8 +1348,10 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-const winMaxPayloadSize = 1024 * 1024 // windows system don't accept more than 1M bytes request even though they tell us maxXXXSize > 1M
-const singleCreditMaxPayloadSize = 64 * 1024
+const (
+	winMaxPayloadSize          = 1024 * 1024 // windows system don't accept more than 1M bytes request even though they tell us maxXXXSize > 1M
+	singleCreditMaxPayloadSize = 64 * 1024
+)
 
 func (f *File) maxReadSize() int {
 	size := min(int(f.fs.maxReadSize), winMaxPayloadSize)
@@ -1520,12 +1429,7 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 }
 
 func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, rr *requestResponse, err error) {
-	creditCharge, m, err := f.fs.loanCredit(n)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(creditCharge)
-		}
-	}()
+	creditCharge, m, err := f.fs.borrowCredits(n)
 	if err != nil {
 		return nil, false, nil, err
 	}
@@ -1623,6 +1527,11 @@ func (f *File) Readdir(n int) (fi []os.FileInfo, err error) {
 //
 // Security queries use SMB2 compound requests (CREATE+QUERY_INFO+CLOSE batched
 // into single round-trips), sub-batching internally to respect credit limits.
+//
+// The returned error reflects the state of the directory listing only: nil,
+// io.EOF after the last entry, or a real Readdir failure. Security failures,
+// whether batch-wide or per-file, are reported on DirEntryPlus.Err. A caller
+// can degrade per-entry instead of abandoning the whole listing.
 func (f *File) ReaddirPlus(n int, securityInfo SecurityInformationRequestFlags) ([]DirEntryPlus, error) {
 	fi, err := f.Readdir(n)
 	if len(fi) == 0 {
@@ -1646,36 +1555,42 @@ func (f *File) ReaddirPlus(n int, securityInfo SecurityInformationRequestFlags) 
 		paths, uint32(securityInfo), f.mapping, f.fs.ctx,
 	)
 	if secErr != nil {
-		// If the compound batch itself failed, return entries without security info
-		// and propagate the batch error on the first entry.
+		// If the compound batch itself failed, return entries without security
+		// info and stamp the batch error on every entry.
 		entries := make([]DirEntryPlus, len(fi))
 		for i, info := range fi {
 			entries[i] = DirEntryPlus{FileInfo: info, Err: secErr}
 		}
-		return entries, errors.Join(err, secErr)
+		return entries, err
 	}
 
 	entries := make([]DirEntryPlus, 0, len(fi))
 	for i, info := range fi {
 		var sd *sddl.SecurityDescriptor
 		var err error
+		// Clone: secResults[i].data is a subslice of a pooled receive buffer, so
+		// after that buffer is recycled a data hazard is introduced.
+		raw := bytes.Clone(secResults[i].data)
 		if secResults[i].err != nil {
 			if isFileDeleted(secResults[i].err) {
 				continue // file deleted between Readdir and security query
 			}
 			err = secResults[i].err
-		} else if secResults[i].data != nil {
+		} else if raw != nil {
 			var parseErr error
-			sd, parseErr = sddl.FromBinary(secResults[i].data)
+			sd, parseErr = sddl.FromBinary(raw)
 			if parseErr != nil {
+				// Retain raw even on parse failure: a caller consuming the
+				// native OS representation may still succeed with these bytes.
 				sd = nil // belt-and-suspenders assignment
 				err = fmt.Errorf("parsing security descriptor for %s: %w", info.Name(), parseErr)
 			}
 		}
 		entries = append(entries, DirEntryPlus{
-			FileInfo:           info,
-			SecurityDescriptor: sd,
-			Err:                err,
+			FileInfo:              info,
+			SecurityDescriptor:    sd,
+			RawSecurityDescriptor: raw,
+			Err:                   err,
 		})
 	}
 
@@ -1780,6 +1695,7 @@ func (f *File) stat() (os.FileInfo, error) {
 		EndOfFile:      std.EndOfFile(),
 		AllocationSize: std.AllocationSize(),
 		FileAttributes: basic.FileAttributes(),
+		FileId:         uint64(info.InternalInformation().IndexNumber()),
 		FileName:       base(f.name),
 	}, nil
 }
@@ -1866,12 +1782,7 @@ func (f *File) Sync() (err error) {
 	req := new(smb2.FlushRequest)
 	req.FileId = f.fd
 
-	req.CreditCharge, _, err = f.fs.loanCredit(0)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(0)
 	if err != nil {
 		return &os.PathError{Op: "sync", Path: f.name, Err: err}
 	}
@@ -1918,12 +1829,7 @@ func (f *File) lockRange(op string, offset, length int64, flags uint32) (err err
 		Locks:  []smb2.LockElement{{Offset: uint64(offset), Length: uint64(length), Flags: flags}},
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(0)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(0)
 	if err != nil {
 		return &os.PathError{Op: op, Path: f.name, Err: err}
 	}
@@ -2004,7 +1910,7 @@ func (f *File) chmod(mode os.FileMode) error {
 
 	attrs := base.FileAttributes()
 
-	if mode&0200 != 0 {
+	if mode&0o200 != 0 {
 		attrs &^= smb2.FILE_ATTRIBUTE_READONLY
 	} else {
 		attrs |= smb2.FILE_ATTRIBUTE_READONLY
@@ -2096,12 +2002,7 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 
 // writeAt allows partial write
 func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
-	creditCharge, m, err := f.fs.loanCredit(len(b))
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(creditCharge)
-		}
-	}()
+	creditCharge, m, err := f.fs.borrowCredits(len(b))
 	if err != nil {
 		return 0, err
 	}
@@ -2337,12 +2238,7 @@ func (f *File) ioctl(req *smb2.IoctlRequest) (output []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(payloadSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2368,7 +2264,7 @@ func (f *File) ioctl(req *smb2.IoctlRequest) (output []byte, err error) {
 
 func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 	req := &smb2.QueryDirectoryRequest{
-		FileInfoClass:      smb2.FileDirectoryInformation,
+		FileInfoClass:      smb2.FileIdBothDirectoryInformation,
 		Flags:              0,
 		FileIndex:          0,
 		OutputBufferLength: uint32(f.maxTransactSize()),
@@ -2382,12 +2278,7 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(payloadSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2407,7 +2298,7 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 	output := r.OutputBuffer()
 
 	for {
-		info := smb2.FileDirectoryInformationDecoder(output)
+		info := smb2.FileIdBothDirectoryInformationDecoder(output)
 		if info.IsInvalid() {
 			return nil, &InvalidResponseError{"broken query directory response format"}
 		}
@@ -2416,20 +2307,25 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 
 		if name != "." && name != ".." {
 			fi = append(fi, &FileStat{
-				CreationTime:   time.Unix(0, info.CreationTime().Nanoseconds()),
-				LastAccessTime: time.Unix(0, info.LastAccessTime().Nanoseconds()),
-				LastWriteTime:  time.Unix(0, info.LastWriteTime().Nanoseconds()),
-				ChangeTime:     time.Unix(0, info.ChangeTime().Nanoseconds()),
-				EndOfFile:      info.EndOfFile(),
-				AllocationSize: info.AllocationSize(),
-				FileAttributes: info.FileAttributes(),
-				FileName:       name,
+				CreationTime:    time.Unix(0, info.CreationTime().Nanoseconds()),
+				LastAccessTime:  time.Unix(0, info.LastAccessTime().Nanoseconds()),
+				LastWriteTime:   time.Unix(0, info.LastWriteTime().Nanoseconds()),
+				ChangeTime:      time.Unix(0, info.ChangeTime().Nanoseconds()),
+				EndOfFile:       info.EndOfFile(),
+				AllocationSize:  info.AllocationSize(),
+				FileAttributes:  info.FileAttributes(),
+				FileId:          info.FileId(),
+				ReparsePointTag: info.ReparsePointTag(),
+				FileName:        name,
 			})
 		}
 
 		next := info.NextEntryOffset()
 		if next == 0 {
 			return fi, nil
+		}
+		if uint64(next) >= uint64(len(output)) {
+			return nil, &InvalidResponseError{"bad directory entry offset"}
 		}
 
 		output = output[next:]
@@ -2443,12 +2339,7 @@ func (f *File) queryInfo(req *smb2.QueryInfoRequest) (infoBytes []byte, err erro
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(payloadSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2482,6 +2373,7 @@ func (f *File) SecurityInfo(flags SecurityInformationRequestFlags) (*sddl.Securi
 	return sd, nil
 }
 
+// SecurityInfoRaw returns the raw security descriptor of the file as a byte array
 func (f *File) SecurityInfoRaw(info SecurityInformationRequestFlags) ([]byte, error) {
 	op := "secinfo"
 	req := &smb2.QueryInfoRequest{
@@ -2496,7 +2388,9 @@ func (f *File) SecurityInfoRaw(info SecurityInformationRequestFlags) ([]byte, er
 		return nil, &os.PathError{Op: op, Path: f.name, Err: err}
 	}
 
-	return infoBytes, nil
+	// Clone: infoBytes is a subslice of a pooled receive buffer, so after that
+	// buffer is recycled a data hazard is introduced.
+	return bytes.Clone(infoBytes), nil
 }
 
 func (f *File) SetSecurityInfo(flags SecurityInformationRequestFlags, sd *sddl.SecurityDescriptor) error {
@@ -2515,14 +2409,9 @@ func (f *File) SetSecurityInfoRaw(flags SecurityInformationRequestFlags, sd smb2
 	}
 
 	var err error
-	req.CreditCharge, _, err = f.fs.loanCredit(req.Size())
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(req.Size())
 	if err != nil {
-		return fmt.Errorf("calling loanCredit: %w", err)
+		return fmt.Errorf("calling borrowCredits: %w", err)
 	}
 
 	_, err = f.sendRecv(smb2.SMB2_SET_INFO, req)
@@ -2540,12 +2429,7 @@ func (f *File) setInfo(req *smb2.SetInfoRequest) (err error) {
 		return &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
-	defer func() {
-		if err != nil {
-			f.fs.chargeCredit(req.CreditCharge)
-		}
-	}()
+	req.CreditCharge, _, err = f.fs.borrowCredits(payloadSize)
 	if err != nil {
 		return err
 	}
@@ -2579,7 +2463,22 @@ type FileStat struct {
 	EndOfFile      int64
 	AllocationSize int64
 	FileAttributes uint32
-	FileName       string
+	// FileId is the server's 64-bit file reference number (the MFT record plus
+	// sequence number on NTFS, the inode number on Samba). It is populated by
+	// File.Readdir, File.ReaddirPlus and File.Stat.
+	//
+	// It is 0 from Share.Stat and Share.Lstat, which report the stat carried by
+	// the CREATE response rather than issuing a separate query, and that
+	// response has no file id; obtain one via File.Stat on an open handle. It
+	// is also 0 when the server itself supplies none, as some legacy and
+	// non-native backends do.
+	FileId uint64
+
+	// ReparsePointTag is the tag that identifies the file system filter
+	// associated with the data when the file is a reparse point. Otherwise, 0.
+	ReparsePointTag uint32
+
+	FileName string
 }
 
 func (fs *FileStat) Name() string {
@@ -2594,13 +2493,13 @@ func (fs *FileStat) Mode() os.FileMode {
 	var m os.FileMode
 
 	if fs.FileAttributes&smb2.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		m |= os.ModeDir | 0111
+		m |= os.ModeDir | 0o111
 	}
 
 	if fs.FileAttributes&smb2.FILE_ATTRIBUTE_READONLY != 0 {
-		m |= 0444
+		m |= 0o444
 	} else {
-		m |= 0666
+		m |= 0o666
 	}
 
 	if fs.FileAttributes&smb2.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -2627,6 +2526,10 @@ func (fs *FileStat) Sys() any {
 type DirEntryPlus struct {
 	os.FileInfo
 	SecurityDescriptor *sddl.SecurityDescriptor
+
+	// RawSecurityDescriptor is the security descriptor exactly as returned on
+	// the wire: a self-relative SECURITY_DESCRIPTOR blob.
+	RawSecurityDescriptor []byte
 
 	Err error // non-nil if the security query failed for this entry
 }

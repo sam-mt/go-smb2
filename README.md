@@ -1,15 +1,15 @@
 smb2
 ====
 
-[![Build Status](https://github.com/maestrohub-labs/go-smb2/actions/workflows/go.yml/badge.svg)](https://github.com/maestrohub-labs/go-smb2/actions/workflows/go.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/maestrohub-labs/go-smb2.svg)](https://pkg.go.dev/github.com/maestrohub-labs/go-smb2)
+[![Build Status](https://github.com/sam-mt/go-smb2/actions/workflows/go.yml/badge.svg)](https://github.com/sam-mt/go-smb2/actions/workflows/go.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sam-mt/go-smb2.svg)](https://pkg.go.dev/github.com/sam-mt/go-smb2)
 
 Description
 -----------
 
 An SMB2/3 client implementation.
 
-This is the **maestrohub-labs** fork of [github.com/cloudsoda/go-smb2](https://github.com/cloudsoda/go-smb2) (itself a fork of [github.com/hirochachacha/go-smb2](https://github.com/hirochachacha/go-smb2)). It adds **transparent DFS (Distributed File System) referral following**: when enabled via `Dialer.EnableDFS`, the client resolves DFS namespace roots and link targets automatically — at `Mount` time and on `STATUS_PATH_NOT_COVERED` mid-operation — by issuing `FSCTL_DFS_GET_REFERRALS` and dialing the backing servers named in the referral. With `EnableDFS` left at its default (`false`), behaviour is byte-for-byte identical to upstream.
+This is the **sam-mt** fork of [github.com/cloudsoda/go-smb2](https://github.com/cloudsoda/go-smb2) (itself a fork of [github.com/hirochachacha/go-smb2](https://github.com/hirochachacha/go-smb2)). It adds **transparent DFS (Distributed File System) referral following**: when enabled via `Dialer.EnableDFS`, the client resolves DFS namespace roots and link targets automatically — at `Mount` time and on `STATUS_PATH_NOT_COVERED` mid-operation — by issuing `FSCTL_DFS_GET_REFERRALS` and dialing the backing servers named in the referral. With `EnableDFS` left at its default (`false`), behaviour is byte-for-byte identical to upstream.
 
 The fork base is preserved as the `fork-base` git tag so the DFS modifications diff cleanly against the upstream source. The upstream BSD-2-Clause licence is retained unchanged in `LICENSE`; see `NOTICE` for the derivative-work attribution and the [MS-DFSC] Open Specification basis of the referral codec.
 
@@ -18,12 +18,12 @@ Any releases will be pre-1.0.0 for some time as features and bug fixes are imple
 Installation
 ------------
 
-`go get github.com/maestrohub-labs/go-smb2`
+`go get github.com/sam-mt/go-smb2`
 
 Documentation
 -------------
 
-https://pkg.go.dev/github.com/maestrohub-labs/go-smb2
+https://pkg.go.dev/github.com/sam-mt/go-smb2
 
 Examples
 --------
@@ -37,7 +37,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 )
 
 func main() {
@@ -65,6 +65,26 @@ func main() {
 }
 ```
 
+### List shares with their type and description ###
+
+`ListShares` returns the same shares as `ListSharenames`, along with the type
+and the description that the server reports for each one.
+
+```go
+	shares, err := s.ListShares()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, share := range shares {
+		// Skip printers, IPC, and shares reserved for remote administration.
+		if share.Type() != smb2.ShareTypeDiskTree || share.IsSpecial() {
+			continue
+		}
+		fmt.Printf("%s\t%s\n", share.Name, share.Comment)
+	}
+```
+
 ### File manipulation ###
 
 ```go
@@ -74,7 +94,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 )
 
 func main() {
@@ -134,7 +154,7 @@ import (
 	"net"
 	"os"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 )
 
 func main() {
@@ -185,7 +205,7 @@ import (
 	"net"
 	iofs "io/fs"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 )
 
 func main() {
@@ -239,7 +259,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 	"github.com/jcmturner/gokrb5/v8/client"
 	"github.com/jcmturner/gokrb5/v8/config"
 )

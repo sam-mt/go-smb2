@@ -2,6 +2,8 @@ package smb2
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -105,9 +107,9 @@ func TestResolve_SelfReferentialRoot_NoLoop(t *testing.T) {
 }
 
 // TestResolve_SelfReferentialRoot_CachedSecondPath covers the cache-hit branch
-// of the no-progress guard: once the root entry is cached, a second non-link
-// path under it must be served from cache (no extra fetch) and still terminate
-// cleanly instead of looping.
+// of the no-progress guard: once the root entry is cached, a second path under
+// it must still be asked about (it may be a link) and terminate cleanly when
+// the server answers with the root again, instead of looping.
 func TestResolve_SelfReferentialRoot_CachedSecondPath(t *testing.T) {
 	calls := 0
 	r := newTestResolver(func(_ context.Context, _, _ string) (*dfsc.ReferralResponse, error) {
@@ -124,8 +126,30 @@ func TestResolve_SelfReferentialRoot_CachedSecondPath(t *testing.T) {
 	if server != "ns" || share != "public" || rel != "b.txt" {
 		t.Errorf("resolve = (%q,%q,%q), want (ns, public, b.txt)", server, share, rel)
 	}
-	if calls != 1 {
-		t.Errorf("fetch called %d times, want 1 (second path must be cache-served)", calls)
+	if calls != 2 {
+		t.Errorf("fetch called %d times, want 2 (a cached root must not answer for paths below it)", calls)
+	}
+}
+
+// TestResolve_LinkUnderCachedSelfRoot is the regression test for links being
+// skipped once their standalone root is cached: resolving a plain path first
+// caches the root, and a link visited afterwards must still be followed.
+func TestResolve_LinkUnderCachedSelfRoot(t *testing.T) {
+	r := newTestResolver(func(_ context.Context, _, unc string) (*dfsc.ReferralResponse, error) {
+		if unc == `\ns\public\link\f.txt` {
+			return storageResp(`\ns\public\link`, `\backing\share`), nil
+		}
+		return rootResp(`\ns\public`, `\ns\public`), nil
+	})
+	if _, _, _, err := r.resolve(context.Background(), `\ns\public\plain.txt`); err != nil {
+		t.Fatalf("plain resolve: %v", err)
+	}
+	server, share, rel, err := r.resolve(context.Background(), `\ns\public\link\f.txt`)
+	if err != nil {
+		t.Fatalf("link resolve: %v", err)
+	}
+	if server != "backing" || share != "share" || rel != "f.txt" {
+		t.Errorf("resolve = (%q,%q,%q), want (backing, share, f.txt)", server, share, rel)
 	}
 }
 
@@ -311,5 +335,134 @@ func TestResolve_LoopDetected(t *testing.T) {
 	})
 	if _, _, _, err := r.resolve(context.Background(), `\a\ns\x`); err == nil {
 		t.Fatal("expected a loop error")
+	}
+}
+
+// replicaResp is a link referral listing several targets (replicas) in
+// the given order, as a Windows DC does, shuffling equal-cost targets.
+func replicaResp(consumedPrefix string, ttl time.Duration, targets ...string) *dfsc.ReferralResponse {
+	resp := &dfsc.ReferralResponse{
+		PathConsumed: uint16(len(utf16.Encode([]rune(consumedPrefix))) * 2),
+		HeaderFlags:  dfsc.HeaderFlagStorageServers,
+	}
+	for _, t := range targets {
+		resp.Referrals = append(resp.Referrals, dfsc.Referral{Version: 4, ServerType: dfsc.ServerTypeLink, TTL: ttl, Path: consumedPrefix, TargetUNC: t})
+	}
+	return resp
+}
+
+// TestResolveWith_Failover: an unusable first target must be skipped in
+// favour of the next one, which is then kept for later resolves.
+func TestResolveWith_Failover(t *testing.T) {
+	r := newTestResolver(func(_ context.Context, _, _ string) (*dfsc.ReferralResponse, error) {
+		return replicaResp(`\ns\dfs\link`, time.Hour, `\down\share`, `\up\share`), nil
+	})
+	var tried []string
+	use := func(server, _, _ string) error {
+		tried = append(tried, server)
+		if server == "down" {
+			return errors.New("unreachable")
+		}
+		return nil
+	}
+	if err := r.resolveWith(context.Background(), `\ns\dfs\link\f`, use); err != nil {
+		t.Fatalf("resolveWith: %v", err)
+	}
+	if want := []string{"down", "up"}; !slices.Equal(tried, want) {
+		t.Fatalf("tried %v, want %v", tried, want)
+	}
+	tried = nil
+	if err := r.resolveWith(context.Background(), `\ns\dfs\link\g`, use); err != nil {
+		t.Fatalf("second resolveWith: %v", err)
+	}
+	if want := []string{"up"}; !slices.Equal(tried, want) {
+		t.Errorf("second resolve tried %v, want the chosen target only %v", tried, want)
+	}
+}
+
+// TestResolveWith_AllTargetsFail: when no target works the error must say
+// so rather than fall back to anything.
+func TestResolveWith_AllTargetsFail(t *testing.T) {
+	r := newTestResolver(func(_ context.Context, _, _ string) (*dfsc.ReferralResponse, error) {
+		return replicaResp(`\ns\dfs\link`, time.Hour, `\a\share`, `\b\share`), nil
+	})
+	err := r.resolveWith(context.Background(), `\ns\dfs\link\f`, func(string, string, string) error {
+		return errors.New("unreachable")
+	})
+	if err == nil {
+		t.Fatal("want an error when every target fails")
+	}
+}
+
+// TestResolveWith_StickyAcrossRefresh: once a replica is chosen it must be
+// kept after the referral expires and the server lists the targets in a
+// different order, as Windows DCs do for equal-cost targets.
+func TestResolveWith_StickyAcrossRefresh(t *testing.T) {
+	order := [][]string{{`\r1\share`, `\r2\share`}, {`\r2\share`, `\r1\share`}}
+	fetches := 0
+	r := newTestResolver(func(_ context.Context, _, _ string) (*dfsc.ReferralResponse, error) {
+		resp := replicaResp(`\ns\dfs\link`, time.Minute, order[fetches%2]...)
+		fetches++
+		return resp, nil
+	})
+	now := time.Unix(1_000_000, 0)
+	r.cache.now = func() time.Time { return now }
+
+	for i := range 2 {
+		server, _, _, err := r.resolve(context.Background(), `\ns\dfs\link\f`)
+		if err != nil {
+			t.Fatalf("resolve %d: %v", i, err)
+		}
+		if server != "r1" {
+			t.Errorf("resolve %d used %q, want the chosen replica r1", i, server)
+		}
+		now = now.Add(2 * time.Minute) // expire the referral
+	}
+	if fetches != 2 {
+		t.Errorf("fetched %d times, want 2 (refresh after expiry)", fetches)
+	}
+}
+
+// TestResolveWith_SharedCacheConverges: resolvers sharing a cache (one per
+// connection of a client) must use the same replica even though the server
+// lists the replicas in a different order for each of them.
+func TestResolveWith_SharedCacheConverges(t *testing.T) {
+	shared := newReferralCache()
+	order := [][]string{{`\r1\share`, `\r2\share`}, {`\r2\share`, `\r1\share`}}
+	for i, o := range order {
+		r := newTestResolver(func(_ context.Context, _, _ string) (*dfsc.ReferralResponse, error) {
+			return replicaResp(`\ns\dfs\link`, time.Hour, o...), nil
+		})
+		r.cache = shared
+		// Expire nothing, but make the second resolver fetch for itself.
+		if i == 1 {
+			shared.mu.Lock()
+			clear(shared.m)
+			shared.mu.Unlock()
+		}
+		server, _, _, err := r.resolve(context.Background(), `\ns\dfs\link\f`)
+		if err != nil {
+			t.Fatalf("resolver %d: %v", i, err)
+		}
+		if server != "r1" {
+			t.Errorf("resolver %d used %q, want r1 chosen by the first", i, server)
+		}
+	}
+}
+
+func TestCachedLink(t *testing.T) {
+	r := newTestResolver(nil)
+	r.cache.put(`\ns\dfs`, []string{`\rootsrv\dfs`}, time.Hour, false)
+	r.cache.put(`\rootsrv\dfs`, []string{`\rootsrv\dfs`}, time.Hour, false)
+	r.cache.put(`\rootsrv\dfs\link`, []string{`\backing\share`}, time.Hour, true)
+	for unc, want := range map[string]bool{
+		`\ns\dfs\link\f`:  true,  // root -> root target -> cached link
+		`\ns\dfs\plain\f`: false, // under the root, no cached link
+		`\ns\dfs`:         false, // the root itself
+		`\other\share\f`:  false, // nothing cached
+	} {
+		if got := r.cachedLink(unc); got != want {
+			t.Errorf("cachedLink(%q)=%v, want %v", unc, got, want)
+		}
 	}
 }

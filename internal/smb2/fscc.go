@@ -142,7 +142,7 @@ func (c SymbolicLinkReparseDataBufferDecoder) PrintName(mc utf16le.MapChars) str
 type SrvRequestResumeKeyResponseDecoder []byte
 
 func (c SrvRequestResumeKeyResponseDecoder) IsInvalid() bool {
-	return len(c) < int(28+c.ContextLength())
+	return uint64(len(c)) < 28+uint64(c.ContextLength())
 }
 
 func (c SrvRequestResumeKeyResponseDecoder) ResumeKey() []byte {
@@ -302,7 +302,7 @@ const (
 type FileDirectoryInformationDecoder []byte
 
 func (c FileDirectoryInformationDecoder) IsInvalid() bool {
-	return len(c) < int(64+c.FileNameLength())
+	return uint64(len(c)) < 64+uint64(c.FileNameLength())
 }
 
 func (c FileDirectoryInformationDecoder) NextEntryOffset() uint32 {
@@ -347,6 +347,99 @@ func (c FileDirectoryInformationDecoder) FileNameLength() uint32 {
 
 func (c FileDirectoryInformationDecoder) FileName(mc utf16le.MapChars) string {
 	return utf16le.Decode(c[64:64+c.FileNameLength()], mc)
+}
+
+// FileIdBothDirectoryInformationDecoder decodes a FILE_ID_BOTH_DIR_INFORMATION
+// entry (MS-FSCC 2.4.22, FileIdBothDirectoryInformation). Its first 64 bytes
+// are laid out identically to FILE_DIRECTORY_INFORMATION; the trailing fields
+// add the short name and the server's 64-bit file reference number.
+type FileIdBothDirectoryInformationDecoder []byte
+
+func (c FileIdBothDirectoryInformationDecoder) IsInvalid() bool {
+	if len(c) < 104 {
+		return true
+	}
+	return uint64(len(c)) < 104+uint64(c.FileNameLength())
+}
+
+func (c FileIdBothDirectoryInformationDecoder) NextEntryOffset() uint32 {
+	return le.Uint32(c[:4])
+}
+
+// FileIndex is the resume cookie for restarting enumeration, not a file
+// identifier; it is commonly 0. See FileId for the file reference number.
+func (c FileIdBothDirectoryInformationDecoder) FileIndex() uint32 {
+	return le.Uint32(c[4:8])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) CreationTime() FiletimeDecoder {
+	return FiletimeDecoder(c[8:16])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) LastAccessTime() FiletimeDecoder {
+	return FiletimeDecoder(c[16:24])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) LastWriteTime() FiletimeDecoder {
+	return FiletimeDecoder(c[24:32])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) ChangeTime() FiletimeDecoder {
+	return FiletimeDecoder(c[32:40])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) EndOfFile() int64 {
+	return int64(le.Uint64(c[40:48]))
+}
+
+func (c FileIdBothDirectoryInformationDecoder) AllocationSize() int64 {
+	return int64(le.Uint64(c[48:56]))
+}
+
+func (c FileIdBothDirectoryInformationDecoder) FileAttributes() uint32 {
+	return le.Uint32(c[56:60])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) FileNameLength() uint32 {
+	return le.Uint32(c[60:64])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) EaSize() uint32 {
+	return le.Uint32(c[64:68])
+}
+
+// ReparsePointTag is the reparse tag (IO_REPARSE_TAG_*) of the entry, or 0 when
+// it is not a reparse point.
+//
+// MS-FSCC 2.4.22 overloads the EaSize field: when FILE_ATTRIBUTE_REPARSE_POINT
+// is set in FileAttributes, the field holds a reparse tag (MS-FSCC 2.1.2.1)
+// instead of the extended-attribute size. This is the same union FindFirstFile
+// exposes as WIN32_FIND_DATA.dwReserved0.
+func (c FileIdBothDirectoryInformationDecoder) ReparsePointTag() uint32 {
+	if c.FileAttributes()&FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		return 0
+	}
+	return c.EaSize()
+}
+
+func (c FileIdBothDirectoryInformationDecoder) ShortNameLength() uint8 {
+	return c[68]
+}
+
+func (c FileIdBothDirectoryInformationDecoder) ShortName(mc utf16le.MapChars) string {
+	n := min(uint64(c.ShortNameLength()), 24)
+	return utf16le.Decode(c[70:70+n], mc)
+}
+
+// FileId is the server's 64-bit file reference number: the MFT record plus
+// sequence number on NTFS, the inode number on Samba. Servers that cannot
+// supply one report 0.
+func (c FileIdBothDirectoryInformationDecoder) FileId() uint64 {
+	return le.Uint64(c[96:104])
+}
+
+func (c FileIdBothDirectoryInformationDecoder) FileName(mc utf16le.MapChars) string {
+	return utf16le.Decode(c[104:104+c.FileNameLength()], mc)
 }
 
 type FileRenameInformationType2Encoder struct {
@@ -440,7 +533,7 @@ func (c FileFsFullSizeInformationDecoder) BytesPerSector() uint32 {
 type FileQuotaInformationDecoder []byte
 
 func (c FileQuotaInformationDecoder) IsInvalid() bool {
-	return len(c) < int(40+c.SidLength())
+	return uint64(len(c)) < 40+uint64(c.SidLength())
 }
 
 func (c FileQuotaInformationDecoder) NextEntryOffset() uint32 {
@@ -682,7 +775,7 @@ func (c FileNameInformationDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(c) < int(4+c.FileNameLength()) {
+	if uint64(len(c)) < 4+uint64(c.FileNameLength()) {
 		return true
 	}
 

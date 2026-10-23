@@ -4,7 +4,7 @@
 .idea
 *.code-workspace
 
-# Internal planning docs (maestrohub-labs fork — not for upstream/public history)
+# Internal planning docs (sam-mt fork — not for upstream/public history)
 IMPLEMENTATION_PLAN.md
 MANUAL_TEST_GUIDE.md
 DESIGN.md

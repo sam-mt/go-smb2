@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -25,17 +27,22 @@ const (
 	minRootTTL = 600 * time.Second
 )
 
-// dfsResolver follows DFS referrals to a backing (server, share, relPath),
-// caching results and reusing one session per backing server. It is
-// created lazily on the first DFS-triggering error for a session.
+// dfsResolver follows DFS referrals to a backing (server, share, relPath)
+// for one mounted share. It is created lazily on the first DFS-triggering
+// error for a session.
 type dfsResolver struct {
-	cache *referralCache
-	conns *backingConns
-	logf  func(format string, args ...any)
+	cache  *referralCache
+	conns  *backingConns
+	origin *Session // the session the share is mounted on
+	logf   func(format string, args ...any)
 	// fetch retrieves one referral for unc from the named server. It is a
 	// field so tests can drive the hop loop without a network; the live
-	// constructor wires it to the IPC$ IOCTL via the backing-conn map.
+	// constructor wires it to the IPC$ IOCTL on the server's session.
 	fetch func(ctx context.Context, server, unc string) (*dfsc.ReferralResponse, error)
+
+	mu           sync.Mutex
+	leases       dfsLeases         // backing sessions used, see backingConns
+	originShares map[string]*Share // shares mounted on origin, key: strings.ToLower(share)
 }
 
 func newDFSResolver(origin *Session) *dfsResolver {
@@ -43,13 +50,20 @@ func newDFSResolver(origin *Session) *dfsResolver {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	cache, conns := newReferralCache(), newBackingConns()
+	if c := origin.dialer.DFSCache; c != nil {
+		cache, conns = c.c, c.conns
+	}
 	r := &dfsResolver{
-		cache: newReferralCache(),
-		conns: newBackingConns(origin),
-		logf:  logf,
+		cache:        cache,
+		conns:        conns,
+		origin:       origin,
+		logf:         logf,
+		leases:       make(dfsLeases),
+		originShares: make(map[string]*Share),
 	}
 	r.fetch = func(ctx context.Context, server, unc string) (*dfsc.ReferralResponse, error) {
-		sess, err := r.conns.sessionFor(ctx, server)
+		sess, err := r.session(ctx, server)
 		if err != nil {
 			return nil, err
 		}
@@ -58,143 +72,239 @@ func newDFSResolver(origin *Session) *dfsResolver {
 	return r
 }
 
-// close releases backing-server sessions.
-func (r *dfsResolver) close() { r.conns.close() }
+// session returns a session to server: the origin session if server is
+// its server, else the backing session to it.
+func (r *dfsResolver) session(ctx context.Context, server string) (*Session, error) {
+	if strings.EqualFold(server, r.origin.serverName()) {
+		return r.origin, nil
+	}
+	bc, err := r.conns.session(ctx, server, r.origin.dialer, r.leases)
+	if err != nil {
+		return nil, err
+	}
+	return bc.s, nil
+}
+
+// share returns a tree connect to \\server\share, see backingConn.share.
+// Shares on the origin server are mounted on the origin session and are
+// this resolver's own.
+func (r *dfsResolver) share(ctx context.Context, server, share string, mapping utf16le.MapChars) (*Share, error) {
+	if !strings.EqualFold(server, r.origin.serverName()) {
+		bc, err := r.conns.session(ctx, server, r.origin.dialer, r.leases)
+		if err != nil {
+			return nil, err
+		}
+		return bc.share(server, share, mapping)
+	}
+
+	key := strings.ToLower(share)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if fs, ok := r.originShares[key]; ok && !fs.Closed() {
+		return fs, nil
+	}
+	fs, err := r.origin.mountRaw(fmt.Sprintf(`\\%s\%s`, server, share), mapping)
+	if err != nil {
+		return nil, fmt.Errorf("dfs: mount backing \\\\%s\\%s: %w", server, share, err)
+	}
+	r.originShares[key] = fs
+	return fs, nil
+}
+
+// close unmounts the shares on the origin session and gives up the
+// backing sessions; the origin session itself is the caller's.
+func (r *dfsResolver) close() {
+	r.mu.Lock()
+	for key, fs := range r.originShares {
+		_ = fs.Umount()
+		delete(r.originShares, key)
+	}
+	r.mu.Unlock()
+	r.conns.release(r.leases)
+}
 
 // resolve follows DFS referrals for unc and returns the backing
-// (server, share, relPath). relPath uses backslash separators and has no
-// leading separator. A non-DFS path (or one no longer covered) resolves
-// to its own split, so resolve is safe to call speculatively.
+// (server, share, relPath) of the first target. relPath uses backslash
+// separators and has no leading separator. A non-DFS path (or one no
+// longer covered) resolves to its own split, so resolve is safe to call
+// speculatively.
 func (r *dfsResolver) resolve(ctx context.Context, unc string) (server, share, relPath string, err error) {
-	unc = normUNC(unc)
-	visited := map[string]bool{}
+	err = r.resolveWith(ctx, unc, func(s, sh, rel string) error {
+		server, share, relPath = s, sh, rel
+		return nil
+	})
+	return server, share, relPath, err
+}
 
-	for range maxDFSHops {
-		// Cache fast path: longest-prefix match short-circuits a network
-		// round trip.
-		if entry, ok := r.cache.longestPrefix(unc); ok {
-			suffix := unc[len(entry.consumedPrefix):]
-			rewritten := entry.target + suffix
-			// A terminal link mapping is done. A root mapping is terminal
-			// only when nothing remains to resolve below the root: with a
-			// remaining suffix we must connect to the root target and issue
-			// a link referral for it (loop again). See the live-fetch
-			// branch below for the rationale.
-			if entry.final || suffix == "" {
-				s, sh, rel := splitUNC(rewritten)
-				return s, sh, rel, nil
-			}
-			// No-progress guard: a self-referential (standalone) root entry
-			// rewrites the UNC to itself — the root target IS the namespace we
-			// just consumed. The remaining suffix is then a plain path under
-			// the root with no covering link, so terminate on the root target
-			// rather than looping. Without this, any non-link path under a
-			// standalone root spins until the visited-set check aborts the
-			// whole resolve with a spurious "referral loop" error.
-			if strings.EqualFold(rewritten, unc) {
-				s, sh, rel := splitUNC(rewritten)
-				return s, sh, rel, nil
-			}
-			unc = rewritten
-			if visited[strings.ToLower(unc)] {
-				return "", "", "", fmt.Errorf("dfs: referral loop resolving %q", unc)
-			}
-			visited[strings.ToLower(unc)] = true
-			continue
-		}
+// resolveWith follows DFS referrals for unc and calls use with the
+// resolved (server, share, relPath) until it succeeds. When a referral
+// lists several targets they are tried in turn, the previously chosen
+// one first (see referralCache), and the one that works is chosen for
+// later calls. This applies at every hop, so both unreachable namespace
+// servers and unreachable link targets (replicas) fail over.
+func (r *dfsResolver) resolveWith(ctx context.Context, unc string, use func(server, share, relPath string) error) error {
+	return r.resolveHop(ctx, normUNC(unc), use, map[string]bool{}, false)
+}
 
+// resolveHop resolves one referral hop for unc. visited holds the UNCs on
+// the current chain, for loop detection. skipCache forces a fetch.
+func (r *dfsResolver) resolveHop(ctx context.Context, unc string, use func(server, share, relPath string) error, visited map[string]bool, skipCache bool) error {
+	if len(visited) >= maxDFSHops {
+		return fmt.Errorf("dfs: exceeded %d referral hops resolving %q", maxDFSHops, unc)
+	}
+	key := strings.ToLower(unc)
+	if visited[key] {
+		return fmt.Errorf("dfs: referral loop resolving %q", unc)
+	}
+	visited[key] = true
+	defer delete(visited, key)
+
+	useUNC := func(u string) error {
+		s, sh, rel := splitUNC(u)
+		return use(s, sh, rel)
+	}
+
+	entry, cached := r.cache.longestPrefix(unc)
+	if !cached || skipCache {
 		srv := serverFromUNC(unc)
 		if srv == "" {
-			return "", "", "", fmt.Errorf("dfs: cannot extract server from %q", unc)
+			return fmt.Errorf("dfs: cannot extract server from %q", unc)
 		}
-
-		resp, rerr := r.fetch(ctx, srv, unc)
-		if rerr != nil {
-			if isNotDFSReferral(rerr) {
+		resp, err := r.fetch(ctx, srv, unc)
+		if err != nil {
+			if isNotDFSReferral(err) {
 				// The path is not (or no longer) DFS-covered: use it
 				// as-is. This terminates chains whose final hop lands on
 				// a plain file server.
-				s, sh, rel := splitUNC(unc)
-				return s, sh, rel, nil
+				return useUNC(unc)
 			}
-			return "", "", "", fmt.Errorf("dfs: referral for %q: %w", unc, rerr)
+			return fmt.Errorf("dfs: referral for %q: %w", unc, err)
 		}
-
-		pick := bestTarget(resp)
-		if pick == nil || resp.PathConsumed == 0 {
+		var ok bool
+		if entry, ok = r.cacheResponse(unc, resp); !ok {
 			// No usable target — treat as not covered.
-			s, sh, rel := splitUNC(unc)
-			return s, sh, rel, nil
+			return useUNC(unc)
 		}
+		cached = false
+	}
 
-		// Classify the response. [MS-DFSC] sets the StorageServers header
-		// flag for BOTH link referrals (the target IS storage) AND root
-		// referrals (ServerType=ROOT — the target is a root/namespace
-		// server you connect to in order to keep resolving). So storage
-		// alone does NOT mean "stop": a root referral is terminal only
-		// when no path remains below the root.
-		consumed := utf16Prefix(unc, resp.PathConsumed)
-		suffix := utf16Suffix(unc, resp.PathConsumed)
-		storage := resp.HeaderFlags&dfsc.HeaderFlagStorageServers != 0
-		isRoot := pick.IsRootTarget()
-
-		// A terminal link mapping (storage link, not an interlink) can be
-		// cached and reused for any path under consumed. A root mapping is
-		// cached too (to skip re-querying the namespace front end) but is
-		// never blindly terminal — terminality is recomputed from the
-		// remaining suffix on every hit.
-		terminalLink := !isRoot && storage
-		ttl := pick.TTL
-		if !terminalLink && ttl < minRootTTL {
-			ttl = minRootTTL
-		}
-		if ttl <= 0 {
-			ttl = minRootTTL
-		}
-		r.cache.put(consumed, pick.TargetUNC, ttl, terminalLink)
-
-		rewritten := pick.TargetUNC + suffix
+	suffix := unc[len(entry.consumedPrefix):]
+	// try resolves unc through the target t.
+	try := func(t string) error {
+		next := t + suffix
 		// Terminal when: a storage link target, or a root referral with
 		// nothing left to resolve below it (we simply connect to the root
-		// target). Otherwise rewrite to the target and loop — the next hop
-		// asks the root/interlink target to resolve the remaining suffix,
-		// which is how a namespace-front-end (Case A) path that then
-		// crosses a link gets fully followed.
-		if terminalLink || (isRoot && suffix == "") {
-			s, sh, rel := splitUNC(rewritten)
-			return s, sh, rel, nil
+		// target). Otherwise the next hop asks the root/interlink target to
+		// resolve the remaining suffix, which is how a namespace-front-end
+		// (Case A) path that then crosses a link gets fully followed.
+		if entry.final || suffix == "" {
+			return useUNC(next)
 		}
-		// No-progress guard (mirrors the cache-hit branch): a self-referential
-		// root referral consumed only the share and points back at itself, so
-		// the remaining suffix is a plain root-relative path with no covering
-		// link. Terminate on the root target instead of looping, which a
-		// standalone root would otherwise do for every non-link path.
-		if isRoot && strings.EqualFold(rewritten, unc) {
-			s, sh, rel := splitUNC(rewritten)
-			return s, sh, rel, nil
+		if strings.EqualFold(next, unc) {
+			// A self-referential (standalone) root: the root target IS
+			// the namespace just consumed. Fresh from the server, that
+			// means no link covers the path, so it is a plain path under
+			// the root. A cached root says nothing about links below it,
+			// so ask the root target about this path.
+			if !cached {
+				return useUNC(next)
+			}
+			delete(visited, key)
+			return r.resolveHop(ctx, unc, use, visited, true)
 		}
-		unc = rewritten
-
-		if visited[strings.ToLower(unc)] {
-			return "", "", "", fmt.Errorf("dfs: referral loop resolving %q", unc)
-		}
-		visited[strings.ToLower(unc)] = true
+		return r.resolveHop(ctx, next, use, visited, false)
 	}
 
-	return "", "", "", fmt.Errorf("dfs: exceeded %d referral hops resolving %q", maxDFSHops, unc)
+	targets, pinned := r.cache.ordered(entry)
+	var errs []error
+	for _, t := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := try(t)
+		if err != nil {
+			r.logf("smb2 dfs: target %s for %s failed: %v", t, entry.consumedPrefix, err)
+			errs = append(errs, err)
+			continue
+		}
+		if chosen := r.cache.pin(entry.consumedPrefix, t, pinned); !strings.EqualFold(chosen, t) {
+			// Another caller chose a different target meanwhile. Use
+			// theirs if possible, so all callers see the same replica.
+			if try(chosen) == nil {
+				return nil
+			}
+		}
+		return nil
+	}
+	return errors.Join(errs...)
 }
 
-// bestTarget picks the first referral entry that carries a target UNC.
-// MS-DFSC lists targets in server preference order, so the first active
-// entry is the right default; richer policies (failback, site costing)
-// can be layered on later.
-func bestTarget(resp *dfsc.ReferralResponse) *dfsc.Referral {
+// cacheResponse caches the referral resp received for unc and returns the
+// entry. ok is false if resp has no usable target.
+func (r *dfsResolver) cacheResponse(unc string, resp *dfsc.ReferralResponse) (entry referralEntry, ok bool) {
+	var targets []string
+	var first *dfsc.Referral
 	for i := range resp.Referrals {
-		if resp.Referrals[i].TargetUNC != "" {
-			return &resp.Referrals[i]
+		if resp.Referrals[i].TargetUNC == "" {
+			continue
 		}
+		if first == nil {
+			first = &resp.Referrals[i]
+		}
+		targets = append(targets, resp.Referrals[i].TargetUNC)
 	}
-	return nil
+	if first == nil || resp.PathConsumed == 0 {
+		return referralEntry{}, false
+	}
+
+	// Classify the response. [MS-DFSC] sets the StorageServers header
+	// flag for BOTH link referrals (the target IS storage) AND root
+	// referrals (ServerType=ROOT — the target is a root/namespace
+	// server you connect to in order to keep resolving). So storage
+	// alone does NOT mean "stop": a root referral is terminal only
+	// when no path remains below the root.
+	consumed := utf16Prefix(unc, resp.PathConsumed)
+	storage := resp.HeaderFlags&dfsc.HeaderFlagStorageServers != 0
+
+	// A terminal link mapping (storage link, not an interlink) can be
+	// cached and reused for any path under consumed. A root mapping is
+	// cached too (to skip re-querying the namespace front end) but is
+	// never blindly terminal — terminality is recomputed from the
+	// remaining suffix on every hit.
+	terminalLink := !first.IsRootTarget() && storage
+	ttl := first.TTL
+	if !terminalLink && ttl < minRootTTL {
+		ttl = minRootTTL
+	}
+	if ttl <= 0 {
+		ttl = minRootTTL
+	}
+	r.cache.put(consumed, targets, ttl, terminalLink)
+	return referralEntry{consumedPrefix: consumed, targets: targets, final: terminalLink}, true
+}
+
+// cachedLink reports whether the cache alone shows that unc is behind a
+// DFS link, so an open can go straight to the target instead of first
+// being refused with STATUS_PATH_NOT_COVERED.
+func (r *dfsResolver) cachedLink(unc string) bool {
+	unc = normUNC(unc)
+	for range maxDFSHops {
+		entry, ok := r.cache.longestPrefix(unc)
+		if !ok {
+			return false
+		}
+		if entry.final {
+			return true
+		}
+		suffix := unc[len(entry.consumedPrefix):]
+		targets, _ := r.cache.ordered(entry)
+		next := targets[0] + suffix
+		if suffix == "" || strings.EqualFold(next, unc) {
+			return false
+		}
+		unc = next
+	}
+	return false
 }
 
 // isNotDFSReferral reports whether err means "this path is not served by

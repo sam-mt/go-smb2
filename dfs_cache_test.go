@@ -7,8 +7,8 @@ import (
 
 func TestReferralCache_PutLongestPrefix(t *testing.T) {
 	c := newReferralCache()
-	c.put(`\ns\dfs`, `\rootsrv\dfs`, time.Hour, false)
-	c.put(`\ns\dfs\link`, `\backing\share`, time.Hour, true)
+	c.put(`\ns\dfs`, []string{`\rootsrv\dfs`}, time.Hour, false)
+	c.put(`\ns\dfs\link`, []string{`\backing\share`}, time.Hour, true)
 
 	// A query under the link must match the longer, more specific entry.
 	e, ok := c.longestPrefix(`\ns\dfs\link\sub\file.csv`)
@@ -31,7 +31,7 @@ func TestReferralCache_PutLongestPrefix(t *testing.T) {
 
 func TestReferralCache_CaseInsensitive(t *testing.T) {
 	c := newReferralCache()
-	c.put(`\NS\DFS\Link`, `\backing\share`, time.Hour, true)
+	c.put(`\NS\DFS\Link`, []string{`\backing\share`}, time.Hour, true)
 	if _, ok := c.longestPrefix(`\ns\dfs\link\x`); !ok {
 		t.Error("DFS lookup must be case-insensitive")
 	}
@@ -39,7 +39,7 @@ func TestReferralCache_CaseInsensitive(t *testing.T) {
 
 func TestReferralCache_BoundaryOnly(t *testing.T) {
 	c := newReferralCache()
-	c.put(`\srv\share`, `\b\sh`, time.Hour, true)
+	c.put(`\srv\share`, []string{`\b\sh`}, time.Hour, true)
 	// `\srv\share2` must NOT match `\srv\share` (different component).
 	if _, ok := c.longestPrefix(`\srv\share2\f`); ok {
 		t.Error("prefix match must respect component boundaries")
@@ -55,7 +55,7 @@ func TestReferralCache_Expiry(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	c.now = func() time.Time { return now }
 
-	c.put(`\ns\link`, `\b\s`, 60*time.Second, true)
+	c.put(`\ns\link`, []string{`\b\s`}, 60*time.Second, true)
 	if _, ok := c.longestPrefix(`\ns\link\f`); !ok {
 		t.Fatal("entry should be live before expiry")
 	}

@@ -1,5 +1,5 @@
-maestrohub-labs/go-smb2
-Copyright 2026 maestrohub-labs
+sam-mt/go-smb2
+Copyright 2026 sam-mt
 
 ------------------------------------------------------------------------
 Derivative work notice
@@ -7,6 +7,7 @@ Derivative work notice
 
 This repository is a fork of, and a derivative work based on:
 
+    github.com/maestrohub-labs/go-smb2
     github.com/cloudsoda/go-smb2
     (itself a fork of github.com/hirochachacha/go-smb2)
     Copyright (c) 2016 Hiroshi Ioka. All rights reserved.
@@ -22,10 +23,10 @@ preserved as the `fork-base` git tag so the modifications below diff
 cleanly against the upstream source.
 
 ------------------------------------------------------------------------
-Modifications by maestrohub-labs
+Modifications by sam-mt
 ------------------------------------------------------------------------
 
-The maestrohub-labs modifications add transparent DFS (Distributed File
+The sam-mt modifications add transparent DFS (Distributed File
 System) referral following to the SMB2 client. These are licensed under
 the same 2-clause BSD license as the upstream work (see LICENSE).
 

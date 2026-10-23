@@ -1,4 +1,4 @@
-module github.com/maestrohub-labs/go-smb2
+module github.com/sam-mt/go-smb2
 
 go 1.25
 
