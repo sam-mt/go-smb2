@@ -1,7 +1,7 @@
 package smb2
 
 import (
-	"github.com/maestrohub-labs/go-smb2/internal/smb2"
+	"github.com/sam-mt/go-smb2/internal/smb2"
 )
 
 // client

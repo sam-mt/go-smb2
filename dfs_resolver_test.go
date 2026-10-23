@@ -8,8 +8,8 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/maestrohub-labs/go-smb2/internal/dfsc"
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/dfsc"
+	"github.com/sam-mt/go-smb2/internal/erref"
 )
 
 func TestUNCHelpers(t *testing.T) {

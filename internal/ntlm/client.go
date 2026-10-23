@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
+	"github.com/sam-mt/go-smb2/internal/utf16le"
 )
 
 // NTLM v2 client

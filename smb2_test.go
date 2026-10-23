@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

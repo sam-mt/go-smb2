@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	smb2 "github.com/maestrohub-labs/go-smb2"
+	smb2 "github.com/sam-mt/go-smb2"
 )
 
 func main() {

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/maestrohub-labs/go-smb2/internal/dfsc"
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
-	"github.com/maestrohub-labs/go-smb2/internal/smb2"
+	"github.com/sam-mt/go-smb2/internal/dfsc"
+	"github.com/sam-mt/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/smb2"
 )
 
 // fsctlMaxOutputResponse bounds the referral buffer we ask the server to

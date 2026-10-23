@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/maestrohub-labs/go-smb2"
+	"github.com/sam-mt/go-smb2"
 )
 
 // A range far past any realistic end of file: the lock is used as a mutex

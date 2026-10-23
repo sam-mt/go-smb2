@@ -6,9 +6,9 @@ import (
 	"net"
 	"testing"
 
-	"github.com/maestrohub-labs/go-smb2/internal/crypto/cmac"
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
-	"github.com/maestrohub-labs/go-smb2/internal/smb2"
+	"github.com/sam-mt/go-smb2/internal/crypto/cmac"
+	"github.com/sam-mt/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/smb2"
 	"github.com/stretchr/testify/require"
 )
 

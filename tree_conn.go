@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/maestrohub-labs/go-smb2/internal/smb2"
-	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
+	"github.com/sam-mt/go-smb2/internal/smb2"
+	"github.com/sam-mt/go-smb2/internal/utf16le"
 )
 
 // sentinelFileId is used for related compound operations.

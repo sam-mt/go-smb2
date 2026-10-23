@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
+	"github.com/sam-mt/go-smb2/internal/utf16le"
 )
 
 func TestNtowfv2(t *testing.T) {

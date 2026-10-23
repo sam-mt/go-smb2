@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/erref"
 )
 
 // status errors - add more if necessary

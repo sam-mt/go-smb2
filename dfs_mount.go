@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
-	"github.com/maestrohub-labs/go-smb2/internal/smb2"
-	"github.com/maestrohub-labs/go-smb2/internal/utf16le"
+	"github.com/sam-mt/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/smb2"
+	"github.com/sam-mt/go-smb2/internal/utf16le"
 )
 
 // dfsRouter carries transparent-DFS state for a top-level Share. It maps

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/erref"
 )
 
 func TestSessionServerName(t *testing.T) {

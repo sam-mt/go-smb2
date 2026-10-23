@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/maestrohub-labs/go-smb2/internal/erref"
+	"github.com/sam-mt/go-smb2/internal/erref"
 )
 
 func TestIsFileDeleted(t *testing.T) {
